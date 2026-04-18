@@ -56,8 +56,16 @@ from typing import Any, AsyncGenerator
 
 import httpx
 import websockets
+from botbuilder.core import (
+    ActivityHandler,
+    BotFrameworkAdapter,
+    BotFrameworkAdapterSettings,
+    TurnContext,
+)
+from botbuilder.schema import Activity
+from botframework.connector.auth import MicrosoftAppCredentials
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from openai import AsyncOpenAI
 
@@ -72,6 +80,13 @@ DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
 ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")
 ELEVENLABS_MODEL = os.getenv("ELEVENLABS_MODEL", "eleven_turbo_v2_5")
+BOT_APP_ID = os.getenv("BOT_APP_ID", "")
+BOT_APP_PASSWORD = os.getenv("BOT_APP_PASSWORD", "")
+BOT_TENANT_ID = os.getenv("BOT_TENANT_ID", "")
+print(
+    f"[bot] AppId loaded: {bool(BOT_APP_ID)} ({BOT_APP_ID[:8]}...), "
+    f"Secret loaded: {bool(BOT_APP_PASSWORD)} (len={len(BOT_APP_PASSWORD)})"
+)
 
 SAMPLE_RATE = 16000
 
@@ -452,6 +467,226 @@ async def chat(request: Request) -> dict:
         return {"reply": reply, "model": OPENROUTER_MODEL}
     except Exception as exc:
         return {"error": str(exc)}
+
+
+# ─── Teams chat bridge (/api/messages) ──────────────────────
+# Handles Bot Framework activities delivered by Teams: JWT-authenticates the
+# request, extracts the user's text, runs a single-turn LLM call, and replies
+# in the same conversation. Uses the same App ID/Secret as the calling bot.
+
+_bot_adapter = BotFrameworkAdapter(
+    BotFrameworkAdapterSettings(
+        app_id=BOT_APP_ID,
+        app_password=BOT_APP_PASSWORD,
+        # channel_auth_tenant: empty → MultiTenant; tenant GUID → SingleTenant
+        channel_auth_tenant=BOT_TENANT_ID or None,
+    )
+)
+
+# Pre-trust the well-known Bot Framework service URLs so outbound replies
+# pick up the AAD token. The adapter trusts them dynamically after successful
+# inbound validation, but doing it up-front avoids a first-request 401.
+for _url in [
+    "https://webchat.botframework.com/",
+    "https://smba.trafficmanager.net/apis/",
+    "https://smba.trafficmanager.net/amer/",
+    "https://smba.trafficmanager.net/emea/",
+    "https://smba.trafficmanager.net/apac/",
+    "https://smba.trafficmanager.net/in/",
+]:
+    MicrosoftAppCredentials.trust_service_url(_url)
+
+
+class AegisChatBot(ActivityHandler):
+    async def on_message_activity(self, ctx: TurnContext) -> None:
+        user_text = (ctx.activity.text or "").strip()
+        user_name = (ctx.activity.from_property.name if ctx.activity.from_property else "?")
+
+        print(f"[LLM] ▶ message from {user_name}: {user_text!r}")
+
+        if not user_text:
+            print("[LLM] ✗ empty text, nothing to send")
+            return
+
+        t0 = time.time()
+        try:
+            print(f"[LLM] → calling {OPENROUTER_MODEL}...")
+            resp = await llm_client.chat.completions.create(
+                model=OPENROUTER_MODEL,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_text},
+                ],
+                temperature=0.7,
+                max_tokens=200,
+            )
+            reply = resp.choices[0].message.content or "(no reply)"
+            elapsed = time.time() - t0
+            usage = getattr(resp, "usage", None)
+            tokens = f"{usage.total_tokens} tok" if usage else "?"
+            print(f"[LLM] ✓ reply ({elapsed:.2f}s, {tokens}): {reply!r}")
+        except Exception as exc:
+            elapsed = time.time() - t0
+            reply = f"Error: {exc}"
+            print(f"[LLM] ✗ failed after {elapsed:.2f}s: {type(exc).__name__}: {exc}")
+
+        print(f"[LLM] → sending reply to Teams (conversation={ctx.activity.conversation.id})")
+        await ctx.send_activity(reply)
+        print("[LLM] ✓ reply delivered")
+
+    async def on_members_added_activity(self, members_added, ctx: TurnContext) -> None:
+        for m in members_added:
+            if m.id != ctx.activity.recipient.id:
+                await ctx.send_activity("Aegis here — ask me anything.")
+
+
+_chat_bot = AegisChatBot()
+
+
+@app.post("/api/messages")
+async def messages(request: Request) -> Response:
+    body = await request.json()
+    auth_header = request.headers.get("Authorization", "")
+
+    print(
+        f"[/api/messages] in: type={body.get('type')} "
+        f"text={body.get('text')!r} "
+        f"from={body.get('from', {}).get('name')!r} "
+        f"serviceUrl={body.get('serviceUrl')} "
+        f"auth_header_present={bool(auth_header)}"
+    )
+
+    # Decode the JWT WITHOUT verifying, purely to see its claims.
+    if auth_header.lower().startswith("bearer "):
+        import jwt as _jwt
+        try:
+            claims = _jwt.decode(
+                auth_header[7:], options={"verify_signature": False, "verify_aud": False}
+            )
+            print(
+                f"[/api/messages] JWT claims: "
+                f"aud={claims.get('aud')} "
+                f"appid={claims.get('appid')} "
+                f"iss={claims.get('iss')} "
+                f"tid={claims.get('tid')} "
+                f"serviceurl={claims.get('serviceurl')}"
+            )
+        except Exception as exc:
+            print(f"[/api/messages] JWT decode failed: {exc}")
+
+    # Trust this specific serviceUrl so outbound reply is authorised.
+    service_url = body.get("serviceUrl")
+    if service_url:
+        MicrosoftAppCredentials.trust_service_url(service_url)
+
+    activity = Activity().deserialize(body)
+
+    async def turn(ctx: TurnContext) -> None:
+        await _chat_bot.on_turn(ctx)
+
+    try:
+        invoke_response = await _bot_adapter.process_activity(activity, auth_header, turn)
+    except Exception as exc:
+        import traceback
+        print(f"[/api/messages] error: {type(exc).__name__}: {exc}")
+        traceback.print_exc()
+        return Response(status_code=500, content=str(exc))
+
+    if invoke_response:
+        return Response(
+            status_code=invoke_response.status,
+            content=json.dumps(invoke_response.body) if invoke_response.body else None,
+            media_type="application/json",
+        )
+    return Response(status_code=201)
+
+
+# ─── Credential diagnostic ──────────────────────────────────
+
+@app.get("/diag/bot-token")
+async def diag_bot_token() -> dict:
+    """Try to obtain a Bot Framework AAD token with the configured creds.
+    Returns the raw token response (access_token trimmed) so you can see
+    exactly why authentication is failing."""
+    data = {
+        "grant_type": "client_credentials",
+        "client_id": BOT_APP_ID,
+        "client_secret": BOT_APP_PASSWORD,
+        "scope": "https://api.botframework.com/.default",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                "https://login.microsoftonline.com/botframework.com/oauth2/v2.0/token",
+                data=data,
+            )
+            body = resp.json()
+            if "access_token" in body:
+                body["access_token"] = body["access_token"][:20] + "... (truncated)"
+            return {"status_code": resp.status_code, "body": body,
+                    "app_id_used": BOT_APP_ID[:8] + "...",
+                    "secret_len": len(BOT_APP_PASSWORD)}
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+# ─── Outbound diagnostic ───────────────────────────────────
+# Reproduces what the bot SDK does when replying: get a Bot Framework token,
+# then POST a probe to webchat.botframework.com. Shows the raw body so we
+# can see WHY the 401 is happening (not just "Unauthorized").
+
+@app.get("/diag/outbound-probe")
+async def diag_outbound_probe() -> dict:
+    """Try both Multi-Tenant and Single-Tenant token endpoints and probe
+    Bot Framework. Whichever combination returns 200/201 from BF is the
+    correct adapter configuration for this bot."""
+
+    async def _probe(token_url: str, label: str) -> dict:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            token_resp = await client.post(
+                token_url,
+                data={
+                    "grant_type": "client_credentials",
+                    "client_id": BOT_APP_ID,
+                    "client_secret": BOT_APP_PASSWORD,
+                    "scope": "https://api.botframework.com/.default",
+                },
+            )
+            if token_resp.status_code != 200:
+                return {"label": label, "stage": "token",
+                        "status": token_resp.status_code,
+                        "body": token_resp.json()}
+
+            token = token_resp.json()["access_token"]
+            probe = await client.post(
+                "https://webchat.botframework.com/v3/conversations",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                },
+                json={"bot": {"id": BOT_APP_ID}, "members": [{"id": "probe-user"}]},
+            )
+            return {
+                "label": label,
+                "stage": "probe",
+                "status_code": probe.status_code,
+                "response_body": probe.text[:400],
+            }
+
+    multi_tenant_url = "https://login.microsoftonline.com/botframework.com/oauth2/v2.0/token"
+    single_tenant_url = (
+        f"https://login.microsoftonline.com/{BOT_TENANT_ID}/oauth2/v2.0/token"
+        if BOT_TENANT_ID else None
+    )
+
+    results = {
+        "app_id_used": BOT_APP_ID,
+        "tenant_id": BOT_TENANT_ID or "(not set)",
+        "multi_tenant": await _probe(multi_tenant_url, "MultiTenant"),
+    }
+    if single_tenant_url:
+        results["single_tenant"] = await _probe(single_tenant_url, "SingleTenant")
+    return results
 
 
 # ─── Control plane (C# → Python notifications) ──────────────
