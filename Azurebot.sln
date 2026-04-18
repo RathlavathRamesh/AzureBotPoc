@@ -1,0 +1,35 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.5.2.0
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "Azurebot", "Azurebot", "{7AFCD919-041C-69F9-4265-7CAD28A001D7}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "media-bot", "media-bot", "{59F82278-F190-4A1E-75DF-557F0F53B92E}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "media-bot", "media-bot", "{962B3A8D-2AEB-AFFD-D9F8-084B2AE35F45}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MediaBot", "Azurebot\media-bot\media-bot\MediaBot.csproj", "{EE092624-8C01-1D5A-7AFD-DE06E6AF720B}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{EE092624-8C01-1D5A-7AFD-DE06E6AF720B}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{EE092624-8C01-1D5A-7AFD-DE06E6AF720B}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{EE092624-8C01-1D5A-7AFD-DE06E6AF720B}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{EE092624-8C01-1D5A-7AFD-DE06E6AF720B}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{59F82278-F190-4A1E-75DF-557F0F53B92E} = {7AFCD919-041C-69F9-4265-7CAD28A001D7}
+		{962B3A8D-2AEB-AFFD-D9F8-084B2AE35F45} = {59F82278-F190-4A1E-75DF-557F0F53B92E}
+		{EE092624-8C01-1D5A-7AFD-DE06E6AF720B} = {962B3A8D-2AEB-AFFD-D9F8-084B2AE35F45}
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {546D1902-6C47-48C9-AE93-80B433793132}
+	EndGlobalSection
+EndGlobal
