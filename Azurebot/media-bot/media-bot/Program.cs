@@ -15,11 +15,27 @@ var builder = WebApplication.CreateBuilder(args);
 
 builder.Services.AddHttpClient();
 builder.Services.AddSingleton<CallHandler>();
+builder.Services.AddSingleton<MediaCallManager>();
 
 var app = builder.Build();
 
 var callHandler = app.Services.GetRequiredService<CallHandler>();
 callHandler.Initialize();
+
+// Initialise app-hosted media only if explicitly enabled. The batch HTTP
+// flow (/api/join + /api/audio-in) works without it.
+if (app.Configuration.GetValue<bool>("EnableAppHostedMedia", false))
+{
+    try
+    {
+        var mediaManager = app.Services.GetRequiredService<MediaCallManager>();
+        mediaManager.Initialize();
+    }
+    catch (Exception ex)
+    {
+        app.Logger.LogError(ex, "MediaCallManager init failed — app-hosted media disabled");
+    }
+}
 
 app.UseWebSockets(new WebSocketOptions { KeepAliveInterval = TimeSpan.FromSeconds(30) });
 
@@ -104,6 +120,28 @@ app.MapPost("/api/leave", async (LeaveRequest request, CallHandler handler) =>
 {
     var success = await handler.LeaveMeetingAsync(request.CallId);
     return Results.Ok(new { success });
+});
+
+// ─── App-hosted media join (auto-listen) ────────────────────
+// Requires EnableAppHostedMedia=true in appsettings and a valid certificate.
+// Joins with appHostedMediaConfig so the bot receives raw PCM frames and
+// automatically posts utterances to /api/audio-in.
+app.MapPost("/api/join-media", async (JoinRequest request, IServiceProvider sp) =>
+{
+    if (!app.Configuration.GetValue<bool>("EnableAppHostedMedia", false))
+        return Results.BadRequest(new { error = "EnableAppHostedMedia is false in appsettings.json" });
+
+    var mediaManager = sp.GetRequiredService<MediaCallManager>();
+    try
+    {
+        var callId = await mediaManager.JoinMeetingAsync(request.MeetingUrl);
+        return Results.Ok(new { success = true, callId });
+    }
+    catch (Exception ex)
+    {
+        app.Logger.LogError(ex, "/api/join-media failed");
+        return Results.Problem(ex.Message);
+    }
 });
 
 app.MapGet("/api/status", (CallHandler handler) => Results.Ok(handler.GetStatus()));

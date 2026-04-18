@@ -1,10 +1,21 @@
 <Project Sdk="Microsoft.NET.Sdk.Web">
 
   <PropertyGroup>
-    <TargetFramework>net10.0</TargetFramework>
+    <TargetFramework>net8.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <RootNamespace>MediaBot</RootNamespace>
+    <!-- Graph Communications media SDK is Windows-native (mixer/codec DLLs) -->
+    <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
   </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Application-hosted media bot for Teams -->
+    <PackageReference Include="Microsoft.Graph.Communications.Calls" Version="1.2.0.9486" />
+    <PackageReference Include="Microsoft.Graph.Communications.Calls.Media" Version="1.2.0.9486" />
+    <PackageReference Include="Microsoft.Graph.Communications.Client" Version="1.2.0.9486" />
+    <PackageReference Include="Microsoft.Graph.Communications.Common" Version="1.2.0.9486" />
+    <PackageReference Include="Microsoft.Skype.Bots.Media" Version="1.26.0.94-alpha" />
+  </ItemGroup>
 
 </Project>
