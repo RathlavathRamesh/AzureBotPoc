@@ -23,6 +23,10 @@ callHandler.Initialize();
 
 app.UseWebSockets(new WebSocketOptions { KeepAliveInterval = TimeSpan.FromSeconds(30) });
 
+// Audio files directory — C# writes TTS MP3s here, Graph fetches via ngrok.
+var audioDir = Path.Combine(app.Environment.ContentRootPath, "audio_files");
+Directory.CreateDirectory(audioDir);
+
 // ─── Health ─────────────────────────────────────────────────
 
 app.MapGet("/health", () => Results.Ok(new
@@ -103,6 +107,63 @@ app.MapPost("/api/leave", async (LeaveRequest request, CallHandler handler) =>
 });
 
 app.MapGet("/api/status", (CallHandler handler) => Results.Ok(handler.GetStatus()));
+
+// ─── Batch voice plumbing ───────────────────────────────────
+// Serve audio files (Graph playPrompt downloads them via ngrok)
+app.MapGet("/audio/{filename}", (string filename) =>
+{
+    var filepath = Path.Combine(audioDir, filename);
+    if (!File.Exists(filepath)) return Results.NotFound();
+    return Results.File(filepath, "audio/mpeg");
+});
+
+// /api/audio-in — the entry point from whichever component captures Teams
+// audio (real media SDK, test tool, simulator). Posts the audio to Python
+// /process-audio and plays the response in the meeting.
+app.MapPost("/api/audio-in", async (HttpRequest request, CallHandler handler) =>
+{
+    using var reader = new StreamReader(request.Body);
+    var bodyStr = await reader.ReadToEndAsync();
+    using var doc = System.Text.Json.JsonDocument.Parse(bodyStr);
+
+    var callId = doc.RootElement.GetProperty("callId").GetString() ?? "";
+    var audioB64 = doc.RootElement.GetProperty("audioBase64").GetString() ?? "";
+
+    if (string.IsNullOrEmpty(callId) || string.IsNullOrEmpty(audioB64))
+        return Results.BadRequest(new { error = "callId and audioBase64 are required" });
+
+    var userAudio = Convert.FromBase64String(audioB64);
+    app.Logger.LogInformation("/api/audio-in: call={CallId} bytes={N}", callId, userAudio.Length);
+
+    var result = await handler.ProcessAudioRoundTripAsync(callId, userAudio, audioDir);
+    return Results.Ok(result);
+});
+
+// /api/speak — accept already-synthesized audio bytes (MP3) and play them.
+// Useful if Python wants to push audio independently of the round-trip.
+app.MapPost("/api/speak", async (HttpRequest request, CallHandler handler) =>
+{
+    using var reader = new StreamReader(request.Body);
+    var bodyStr = await reader.ReadToEndAsync();
+    using var doc = System.Text.Json.JsonDocument.Parse(bodyStr);
+
+    var callId = doc.RootElement.GetProperty("callId").GetString() ?? "";
+    var audioB64 = doc.RootElement.GetProperty("audioBase64").GetString() ?? "";
+
+    if (string.IsNullOrEmpty(callId) || string.IsNullOrEmpty(audioB64))
+        return Results.BadRequest(new { error = "callId and audioBase64 required" });
+
+    var audio = Convert.FromBase64String(audioB64);
+    var filename = $"{Guid.NewGuid():N}.mp3";
+    var filepath = Path.Combine(audioDir, filename);
+    await File.WriteAllBytesAsync(filepath, audio);
+
+    var audioUrl = $"{app.Configuration["CallbackUrl"]}/audio/{filename}";
+    app.Logger.LogInformation("/api/speak: call={CallId} url={Url}", callId, audioUrl);
+
+    var ok = await handler.PlayPromptAsync(callId, audioUrl);
+    return Results.Ok(new { success = ok, audioUrl, size = audio.Length });
+});
 
 app.Logger.LogInformation("Aegis Media Bot (streaming) on http://localhost:5000");
 app.Run("http://localhost:5000");

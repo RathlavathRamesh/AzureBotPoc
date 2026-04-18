@@ -630,6 +630,138 @@ async def diag_bot_token() -> dict:
         return {"error": str(exc)}
 
 
+# ─── Batch voice pipeline (HTTP, no WebSocket) ───────────────
+# Simple request/response flow for Teams voice:
+#   C# captures user audio →
+#   C# POSTs /process-audio with audio bytes →
+#   Python STT → LLM → TTS (all batch, single-shot) →
+#   Python returns TTS audio bytes →
+#   C# plays the audio in the Teams meeting via Graph playPrompt.
+#
+# The streaming /voice/sessions/{id} WebSocket stays in the code for later,
+# but it is not used by this flow.
+
+async def _stt_batch(audio_bytes: bytes) -> str:
+    """One-shot STT against Deepgram REST (no WebSocket)."""
+    if not DEEPGRAM_API_KEY:
+        return "[Deepgram not configured]"
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(
+            "https://api.deepgram.com/v1/listen"
+            "?model=nova-2&language=en-US&punctuate=true&smart_format=true",
+            headers={
+                "Authorization": f"Token {DEEPGRAM_API_KEY}",
+                "Content-Type": "audio/wav",
+            },
+            content=audio_bytes,
+        )
+        if resp.status_code != 200:
+            print(f"[STT] ✗ {resp.status_code}: {resp.text[:200]}")
+            return ""
+        data = resp.json()
+        transcript = (
+            data.get("results", {}).get("channels", [{}])[0]
+            .get("alternatives", [{}])[0].get("transcript", "")
+        )
+        return transcript
+
+
+async def _llm_batch(user_text: str) -> str:
+    """One-shot LLM call (non-streaming)."""
+    if not OPENROUTER_API_KEY:
+        return f"[LLM not configured] You said: {user_text}"
+
+    resp = await llm_client.chat.completions.create(
+        model=OPENROUTER_MODEL,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_text},
+        ],
+        temperature=0.7,
+        max_tokens=200,
+    )
+    return resp.choices[0].message.content or ""
+
+
+async def _tts_batch(text: str) -> bytes | None:
+    """One-shot TTS via ElevenLabs REST (returns MP3 bytes)."""
+    if not ELEVENLABS_API_KEY:
+        return None
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(
+            f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}",
+            headers={
+                "xi-api-key": ELEVENLABS_API_KEY,
+                "Content-Type": "application/json",
+            },
+            json={
+                "text": text,
+                "model_id": "eleven_turbo_v2_5",
+                "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
+            },
+        )
+        if resp.status_code != 200:
+            print(f"[TTS] ✗ {resp.status_code}: {resp.text[:200]}")
+            return None
+        return resp.content
+
+
+@app.post("/process-audio")
+async def process_audio(request: Request) -> dict:
+    """Full batch voice pipeline. C# posts user audio, gets reply audio back.
+
+    Body:
+        { "call_id": "...", "audio_base64": "<base64 WAV>" }
+
+    Returns:
+        {
+            "transcript": "...",
+            "reply": "...",
+            "audio_base64": "<base64 MP3>" or null,
+            "audio_size": int
+        }
+    """
+    body = await request.json()
+    call_id = body.get("call_id", "?")
+    audio_b64 = body.get("audio_base64", "")
+
+    if not audio_b64:
+        return {"error": "audio_base64 is required"}
+
+    audio_bytes = base64.b64decode(audio_b64)
+    print(f"[voice] ▶ /process-audio call={call_id} bytes={len(audio_bytes)}")
+
+    # 1. STT
+    t0 = time.time()
+    transcript = await _stt_batch(audio_bytes)
+    print(f"[voice] 🎤 STT ({time.time()-t0:.2f}s): {transcript!r}")
+    if not transcript:
+        return {"error": "no transcript", "transcript": ""}
+
+    # 2. LLM
+    t0 = time.time()
+    reply = await _llm_batch(transcript)
+    print(f"[voice] 🤖 LLM ({time.time()-t0:.2f}s): {reply!r}")
+
+    # 3. TTS
+    t0 = time.time()
+    tts = await _tts_batch(reply)
+    print(f"[voice] 🔊 TTS ({time.time()-t0:.2f}s): "
+          f"{len(tts) if tts else 0} bytes")
+
+    tts_b64 = base64.b64encode(tts).decode() if tts else None
+    print(f"[voice] ✓ round-trip done — returning to C#")
+
+    return {
+        "transcript": transcript,
+        "reply": reply,
+        "audio_base64": tts_b64,
+        "audio_size": len(tts) if tts else 0,
+    }
+
+
 # ─── Outbound diagnostic ───────────────────────────────────
 # Reproduces what the bot SDK does when replying: get a Bot Framework token,
 # then POST a probe to webchat.botframework.com. Shows the raw body so we

@@ -350,6 +350,132 @@ public class CallHandler
         }
     }
 
+    // ─── Batch voice (HTTP, no WebSocket) ───────────────────
+    // 1. C# gets raw audio from somewhere (test payload, Graph notification,
+    //    future media SDK) and posts it to Python /process-audio.
+    // 2. Python returns TTS audio bytes.
+    // 3. C# saves the audio as a file, serves it via the /audio/{name}
+    //    endpoint (public via ngrok) and calls Graph playPrompt so the bot
+    //    speaks it in the meeting.
+
+    public async Task<object> ProcessAudioRoundTripAsync(
+        string callId, byte[] userAudio, string audioDir)
+    {
+        _logger.LogInformation("[voice] ▶ round-trip start call={CallId} bytes={N}",
+            callId, userAudio.Length);
+
+        var pythonUrl = _config["PythonBackendUrl"] ?? "http://localhost:8000";
+
+        using var http = _httpFactory.CreateClient();
+        http.Timeout = TimeSpan.FromSeconds(60);
+
+        var payload = new
+        {
+            call_id = callId,
+            audio_base64 = Convert.ToBase64String(userAudio),
+        };
+
+        var json = JsonSerializer.Serialize(payload);
+        _logger.LogInformation("[voice] → POST {Url}/process-audio", pythonUrl);
+
+        var resp = await http.PostAsync(
+            $"{pythonUrl}/process-audio",
+            new StringContent(json, Encoding.UTF8, "application/json"));
+
+        var body = await resp.Content.ReadAsStringAsync();
+        if (!resp.IsSuccessStatusCode)
+        {
+            _logger.LogError("[voice] ✗ Python returned {Status}: {Body}",
+                resp.StatusCode, body[..Math.Min(300, body.Length)]);
+            return new { success = false, error = body };
+        }
+
+        var result = JsonDocument.Parse(body).RootElement;
+        var transcript = result.TryGetProperty("transcript", out var t) ? t.GetString() : "";
+        var reply = result.TryGetProperty("reply", out var r) ? r.GetString() : "";
+        var ttsB64 = result.TryGetProperty("audio_base64", out var a) ? a.GetString() : null;
+
+        _logger.LogInformation("[voice] 🎤 transcript: {T}", transcript);
+        _logger.LogInformation("[voice] 🤖 reply: {R}", reply);
+
+        if (string.IsNullOrEmpty(ttsB64))
+        {
+            _logger.LogWarning("[voice] ✗ no audio in Python response");
+            return new { success = false, transcript, reply, error = "no_tts_audio" };
+        }
+
+        var ttsBytes = Convert.FromBase64String(ttsB64);
+        _logger.LogInformation("[voice] 🔊 got {N} bytes of TTS audio", ttsBytes.Length);
+
+        // Save and serve so Graph can fetch it.
+        Directory.CreateDirectory(audioDir);
+        var filename = $"{Guid.NewGuid():N}.mp3";
+        var filepath = Path.Combine(audioDir, filename);
+        await File.WriteAllBytesAsync(filepath, ttsBytes);
+
+        var audioUrl = $"{_config["CallbackUrl"]}/audio/{filename}";
+        _logger.LogInformation("[voice] → playPrompt {Url}", audioUrl);
+
+        var played = await PlayPromptAsync(callId, audioUrl);
+        _logger.LogInformation("[voice] ✓ playPrompt: {Ok}", played);
+
+        return new
+        {
+            success = played,
+            transcript,
+            reply,
+            audio_size = ttsBytes.Length,
+            audio_url = audioUrl,
+        };
+    }
+
+    public async Task<bool> PlayPromptAsync(string callId, string audioUrl)
+    {
+        if (!_activeCalls.ContainsKey(callId))
+        {
+            _logger.LogWarning("playPrompt: call {CallId} is not active", callId);
+            return false;
+        }
+
+        try
+        {
+            var tenantId = _activeCalls[callId].TenantId;
+            var token = await GetGraphTokenAsync(tenantId);
+            using var http = _httpFactory.CreateClient();
+            http.DefaultRequestHeaders.Authorization =
+                new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", token);
+
+            var payload = $$"""
+            {
+                "clientContext": "aegis-batch-{{Guid.NewGuid():N}}",
+                "prompts": [{
+                    "@odata.type": "#microsoft.graph.mediaPrompt",
+                    "mediaInfo": {
+                        "@odata.type": "#microsoft.graph.mediaInfo",
+                        "uri": "{{audioUrl}}",
+                        "resourceId": "{{Guid.NewGuid()}}"
+                    }
+                }]
+            }
+            """;
+
+            var resp = await http.PostAsync(
+                $"https://graph.microsoft.com/beta/communications/calls/{callId}/playPrompt",
+                new StringContent(payload, Encoding.UTF8, "application/json"));
+
+            var body = await resp.Content.ReadAsStringAsync();
+            _logger.LogInformation("playPrompt {Status}: {Body}",
+                resp.StatusCode, body[..Math.Min(200, body.Length)]);
+
+            return resp.IsSuccessStatusCode;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "playPrompt failed for {CallId}", callId);
+            return false;
+        }
+    }
+
     // ─── Incoming calling webhook (/api/calling) ────────────
 
     public async Task<bool> HandleIncomingCallAsync(HttpRequest request)
