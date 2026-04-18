@@ -1,24 +1,24 @@
 // ─── CallHandler ─────────────────────────────────────────────
-// Purpose: Streaming bridge between a Teams meeting (ACS Media Streaming
-//          over WebSocket) and the Python voice pipeline (duplex WebSocket).
+// Purpose: Streaming bridge between a Teams meeting (Graph Communications /
+//          application-hosted media — PCM frames delivered to /ws) and the
+//          Python voice pipeline (duplex WebSocket).
 //
 //          Flow per call:
-//            Teams/ACS → /ws (this bot) → Python /voice/sessions/{callId}
-//                                          → stt.partial/final, llm.partial,
-//                                            tts.audio (PCM chunks)
-//                        ← OutStreamingData ← tts.audio
+//            Teams frames → /ws (this bot) → Python /voice/sessions/{callId}
+//                                             → stt.partial/final,
+//                                               llm.partial, tts.audio
+//                           ← OutStreamingData (PCM) ← tts.audio
 //
 //          No files, no playPrompt. TTS PCM chunks are written directly into
-//          the ACS WebSocket as OutStreamingData — the bot starts speaking
-//          as soon as the first chunks arrive. On tts.cancel we send
-//          StopAudio to ACS and flush the playout buffer (barge-in).
+//          the media WebSocket as frame data — the bot starts speaking as
+//          soon as the first chunks arrive. On tts.cancel we send StopAudio
+//          and flush the playout buffer (barge-in).
 // ─────────────────────────────────────────────────────────────
 
 using System.Collections.Concurrent;
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
-using Azure.Communication.CallAutomation;
 
 namespace MediaBot;
 
@@ -27,14 +27,13 @@ public class CallHandler
     private readonly IConfiguration _config;
     private readonly ILogger<CallHandler> _logger;
     private readonly IHttpClientFactory _httpFactory;
-    private CallAutomationClient? _acsClient;
 
     private readonly ConcurrentDictionary<string, CallInfo> _activeCalls = new();
     private readonly ConcurrentDictionary<string, VoiceSession> _sessions = new();
 
-    // Tracks Graph callId → ACS WebSocket so we can route OutStreamingData
-    // for a Python session back to the correct ACS socket.
-    private readonly ConcurrentDictionary<string, WebSocket> _acsSockets = new();
+    // Tracks Graph callId → media WebSocket so we can route outbound TTS
+    // back to the correct Teams audio socket.
+    private readonly ConcurrentDictionary<string, WebSocket> _mediaSockets = new();
 
     public CallHandler(IConfiguration config, ILogger<CallHandler> logger, IHttpClientFactory httpFactory)
     {
@@ -43,33 +42,16 @@ public class CallHandler
         _httpFactory = httpFactory;
     }
 
-    public bool Initialize()
+    public void Initialize()
     {
-        var connectionString = _config["ACS:ConnectionString"];
-        if (string.IsNullOrEmpty(connectionString))
-        {
-            _logger.LogWarning("ACS not configured — running in mock mode");
-            return false;
-        }
-
-        _acsClient = new CallAutomationClient(connectionString);
-        _logger.LogInformation("ACS client initialized");
-        return true;
+        _logger.LogInformation("CallHandler initialised (streaming mode)");
     }
 
-    // ─── Join (Graph answer + ACS audio streaming) ──────────
+    // ─── Join (Graph answer) ────────────────────────────────
 
     public async Task<JoinResult> JoinMeetingAsync(string meetingUrl, string? meetingId = null, string? passcode = null)
     {
         _logger.LogInformation("Join requested: MeetingId={Id}", meetingId ?? "from-url");
-
-        if (_acsClient == null)
-        {
-            var mockId = $"mock-{Guid.NewGuid().ToString()[..8]}";
-            _activeCalls[mockId] = new CallInfo { CallId = mockId, MeetingUrl = meetingUrl };
-            await NotifyPythonControlAsync("call_connected", new { callId = mockId, mock = true });
-            return new JoinResult { Success = true, CallId = mockId, Mock = true };
-        }
 
         try
         {
@@ -80,8 +62,8 @@ public class CallHandler
             var actualMeetingId = meetingId ?? ExtractMeetingId(meetingUrl);
             var actualPasscode = passcode ?? ExtractPasscode(meetingUrl);
 
-            // Graph answer uses a per-call callback — real-time media bot best
-            // practice per Microsoft: pin call state to a specific instance.
+            // Per-call callback — real-time media bot best practice: pin call
+            // state to a specific instance via its own callback URL.
             var tempCallbackId = Guid.NewGuid().ToString("N")[..12];
             var callbackUri = $"{callbackBase}/api/calls/{tempCallbackId}/callback";
 
@@ -133,10 +115,6 @@ public class CallHandler
             _logger.LogInformation("✓ Bot joined meeting: {CallId}", callId);
             await NotifyPythonControlAsync("call_connected", new { callId });
 
-            // ACS joins the same meeting as a second audio participant so we
-            // get a live frame-by-frame audio stream over /ws.
-            _ = Task.Run(() => JoinAcsForAudioAsync(callId));
-
             return new JoinResult { Success = true, CallId = callId };
         }
         catch (Exception ex)
@@ -146,24 +124,23 @@ public class CallHandler
         }
     }
 
-    // ─── ACS WebSocket: duplex audio with Teams ─────────────
+    // ─── Media WebSocket: duplex audio with Teams ───────────
 
-    public async Task HandleAudioStreamAsync(WebSocket acsWs)
+    public async Task HandleAudioStreamAsync(WebSocket mediaWs)
     {
-        // The ACS socket carries audio both ways:
-        //   inbound:  {kind:"AudioData", audioData:{data:<base64 PCM>, silent:bool}}
-        //   outbound: same shape; we write TTS PCM chunks here to speak.
-        _logger.LogInformation("🎤 ACS WebSocket connected");
+        // Inbound:  {kind:"AudioData", audioData:{data:<base64 PCM>, silent:bool}}
+        // Outbound: same shape; we write TTS PCM chunks here to speak.
+        _logger.LogInformation("🎤 Media WebSocket connected");
 
         // Which Graph call does this socket belong to? We bind it to the most
         // recent joined call — a stateful worker only handles one call per
         // instance (per Microsoft guidance), so this is safe.
         var callId = _activeCalls.Keys.LastOrDefault() ?? "unknown";
-        _acsSockets[callId] = acsWs;
+        _mediaSockets[callId] = mediaWs;
 
         // Open the Python voice session for this call. The session is the
         // duplex pipeline — STT + LLM + TTS all flow through it.
-        var session = await OpenPythonSessionAsync(callId, acsWs);
+        var session = await OpenPythonSessionAsync(callId, mediaWs);
         if (session == null)
         {
             _logger.LogError("Could not open Python session for {CallId}", callId);
@@ -177,12 +154,12 @@ public class CallHandler
 
         try
         {
-            while (acsWs.State == WebSocketState.Open)
+            while (mediaWs.State == WebSocketState.Open)
             {
-                var result = await acsWs.ReceiveAsync(new ArraySegment<byte>(buffer), CancellationToken.None);
+                var result = await mediaWs.ReceiveAsync(new ArraySegment<byte>(buffer), CancellationToken.None);
                 if (result.MessageType == WebSocketMessageType.Close)
                 {
-                    await acsWs.CloseAsync(WebSocketCloseStatus.NormalClosure, "", CancellationToken.None);
+                    await mediaWs.CloseAsync(WebSocketCloseStatus.NormalClosure, "", CancellationToken.None);
                     break;
                 }
 
@@ -196,7 +173,7 @@ public class CallHandler
 
                 if (kind == "AudioMetadata")
                 {
-                    _logger.LogInformation("ACS audio metadata received");
+                    _logger.LogInformation("Audio metadata received");
                     continue;
                 }
 
@@ -222,12 +199,12 @@ public class CallHandler
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "ACS WebSocket error");
+            _logger.LogError(ex, "Media WebSocket error");
         }
         finally
         {
-            _logger.LogInformation("ACS WebSocket closed for {CallId} (frames: {N})", callId, frameSeq);
-            _acsSockets.TryRemove(callId, out _);
+            _logger.LogInformation("Media WebSocket closed for {CallId} (frames: {N})", callId, frameSeq);
+            _mediaSockets.TryRemove(callId, out _);
             await session.CloseAsync();
             _sessions.TryRemove(callId, out _);
         }
@@ -235,7 +212,7 @@ public class CallHandler
 
     // ─── Python duplex session ──────────────────────────────
 
-    private async Task<VoiceSession?> OpenPythonSessionAsync(string callId, WebSocket acsWs)
+    private async Task<VoiceSession?> OpenPythonSessionAsync(string callId, WebSocket mediaWs)
     {
         var pyBase = _config["PythonBackendUrl"] ?? "http://localhost:8000";
         var wsUrl = pyBase.Replace("http://", "ws://").Replace("https://", "wss://")
@@ -254,9 +231,9 @@ public class CallHandler
 
         _logger.LogInformation("✓ Python voice session open: {Url}", wsUrl);
 
-        var session = new VoiceSession(callId, client, acsWs, _logger);
+        var session = new VoiceSession(callId, client, mediaWs, _logger);
 
-        // Pump events from Python → ACS / logs.
+        // Pump events from Python → Teams / logs.
         _ = Task.Run(session.PumpFromPythonAsync);
 
         return session;
@@ -267,76 +244,6 @@ public class CallHandler
         var json = JsonSerializer.Serialize(payload);
         var bytes = Encoding.UTF8.GetBytes(json);
         await session.PythonWs.SendAsync(bytes, WebSocketMessageType.Text, true, CancellationToken.None);
-    }
-
-    // ─── ACS join for audio streaming ───────────────────────
-
-    private async Task JoinAcsForAudioAsync(string graphCallId)
-    {
-        if (_acsClient == null) return;
-
-        try
-        {
-            // Wait for Graph to deliver chatInfo.threadId via the per-call
-            // callback (usually <2s).
-            await Task.Delay(5000);
-
-            _activeCalls.TryGetValue(graphCallId, out var callInfo);
-            string meetingUrl;
-            if (!string.IsNullOrEmpty(callInfo?.ThreadId))
-            {
-                var encoded = Uri.EscapeDataString(callInfo.ThreadId);
-                meetingUrl = $"https://teams.microsoft.com/l/meetup-join/{encoded}/0";
-            }
-            else if (!string.IsNullOrEmpty(callInfo?.MeetingId))
-            {
-                meetingUrl = $"https://teams.microsoft.com/meet/{callInfo.MeetingId}?p={callInfo.Passcode}";
-            }
-            else if (!string.IsNullOrEmpty(callInfo?.MeetingUrl))
-            {
-                meetingUrl = callInfo.MeetingUrl;
-            }
-            else
-            {
-                _logger.LogError("No meeting URL available for ACS join on call {Id}", graphCallId);
-                return;
-            }
-
-            var callbackBase = _config["CallbackUrl"]!;
-            var wsUrl = callbackBase.Replace("https://", "wss://").Replace("http://", "ws://") + "/ws";
-            var callbackUri = new Uri($"{callbackBase}/api/acs-events");
-
-            var streamingOptions = new MediaStreamingOptions(
-                MediaStreamingAudioChannel.Mixed,
-                StreamingTransport.Websocket)
-            {
-                TransportUri = new Uri(wsUrl),
-                StartMediaStreaming = true,
-                // bidirectional — we send TTS back to Teams on this same socket
-                EnableBidirectional = true,
-                AudioFormat = AudioFormat.Pcm16KMono,
-            };
-
-            // ACS SDK 1.6.0-beta.2 has no MicrosoftTeamsMeetingLocator. The
-            // supported path for joining a Graph-answered Teams meeting is
-            // ConnectCallAsync(ServerCallLocator(serverCallId), ...) once the
-            // serverCallId is obtained. That ID is available from the Graph
-            // /communications/calls/{id} GET — fetched once the call reaches
-            // the "established" state. For now we log and rely on a manual
-            // ACS join: ACS can also be wired via an external trigger that
-            // calls ConnectCallAsync with the right ServerCallLocator.
-            _logger.LogWarning(
-                "ACS auto-join skipped: MicrosoftTeamsMeetingLocator not in SDK 1.6.0-beta.2. " +
-                "MeetingUrl={Url}. ACS WS endpoint ready at {Ws} — trigger ConnectCallAsync " +
-                "with ServerCallLocator(serverCallId) once available.",
-                meetingUrl, wsUrl);
-            _ = callbackUri;
-            _ = streamingOptions;
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "ACS audio join failed for {Id}", graphCallId);
-        }
     }
 
     // ─── Leave ──────────────────────────────────────────────
@@ -374,11 +281,11 @@ public class CallHandler
 
     // ─── Graph call event webhooks ──────────────────────────
 
-    public async Task HandleCallEventAsync(BinaryData requestBody, string? callbackToken = null)
+    public async Task HandleCallEventAsync(byte[] requestBody, string? callbackToken = null)
     {
         try
         {
-            var rawJson = requestBody.ToString();
+            var rawJson = Encoding.UTF8.GetString(requestBody);
             _logger.LogInformation("Call webhook ({Token}): {Json}",
                 callbackToken ?? "-", rawJson[..Math.Min(800, rawJson.Length)]);
 
@@ -443,15 +350,7 @@ public class CallHandler
         }
     }
 
-    public Task HandleAcsEventAsync(BinaryData body)
-    {
-        _logger.LogInformation("ACS event: {Json}", body.ToString()[..Math.Min(300, body.ToString().Length)]);
-        return Task.CompletedTask;
-    }
-
     // ─── Incoming calling webhook (/api/calling) ────────────
-    // For the application-hosted media bot, Teams POSTs incoming call
-    // invitations here with a Bearer token.
 
     public async Task<bool> HandleIncomingCallAsync(HttpRequest request)
     {
@@ -467,16 +366,14 @@ public class CallHandler
             return false;
         }
 
-        // Token validation (issuer, audience, signature) should be done via
-        // Microsoft.IdentityModel / JwtBearerHandler in production. For the
-        // POC we log the token and accept it.
+        // TODO: validate the JWT (issuer, audience, signature) with
+        // Microsoft.IdentityModel / JwtBearerHandler before production.
         _logger.LogInformation("/api/calling token received (len={Len})", authStr.Length - 7);
 
         using var reader = new StreamReader(request.Body);
         var body = await reader.ReadToEndAsync();
         _logger.LogInformation("/api/calling body: {Body}", body[..Math.Min(400, body.Length)]);
 
-        // TODO: Parse the invite, call Graph answer with a per-call callback.
         await NotifyPythonControlAsync("incoming_call", new { body = body[..Math.Min(1000, body.Length)] });
         return true;
     }
@@ -503,7 +400,6 @@ public class CallHandler
         activeCalls = _activeCalls.Count,
         sessions = _sessions.Count,
         calls = _activeCalls.Values.Select(c => new { c.CallId, c.MeetingUrl }),
-        acsConfigured = _acsClient != null,
     };
 
     // ─── Graph token ────────────────────────────────────────
@@ -580,15 +476,15 @@ public class CallHandler
 
 public class VoiceSession
 {
-    // ACS expects 20ms frames of 16-bit mono 16kHz PCM = 640 bytes/frame.
-    // We buffer ~300ms before starting playback to absorb jitter, then
-    // push one frame every 20ms while chunks keep arriving.
+    // 20ms frames of 16-bit mono 16kHz PCM = 640 bytes/frame. We buffer
+    // ~300ms before starting playback to absorb jitter, then push one frame
+    // every 20ms while chunks keep arriving.
     private const int PlayoutBufferMs = 300;
     private const int FrameBytes = 640;
 
     public string CallId { get; }
     public ClientWebSocket PythonWs { get; }
-    public WebSocket AcsWs { get; }
+    public WebSocket MediaWs { get; }
 
     private readonly ILogger _logger;
     private readonly Queue<byte[]> _playout = new();
@@ -596,15 +492,13 @@ public class VoiceSession
     private CancellationTokenSource _playbackCts = new();
     private Task? _playbackTask;
 
-    public VoiceSession(string callId, ClientWebSocket pythonWs, WebSocket acsWs, ILogger logger)
+    public VoiceSession(string callId, ClientWebSocket pythonWs, WebSocket mediaWs, ILogger logger)
     {
         CallId = callId;
         PythonWs = pythonWs;
-        AcsWs = acsWs;
+        MediaWs = mediaWs;
         _logger = logger;
     }
-
-    // ─── Python → ACS pump ──────────────────────────────────
 
     public async Task PumpFromPythonAsync()
     {
@@ -670,7 +564,6 @@ public class VoiceSession
 
     private async Task EnqueueTtsChunkAsync(byte[] pcm)
     {
-        // Slice into 20ms frames so ACS gets a steady feed.
         await _playoutLock.WaitAsync();
         try
         {
@@ -697,7 +590,7 @@ public class VoiceSession
     private async Task PlaybackLoopAsync(CancellationToken ct)
     {
         // Prime the buffer with PlayoutBufferMs worth of audio before we start
-        // writing to ACS — smooths over jitter from the LLM/TTS pipeline.
+        // writing to the media socket — smooths over jitter from the pipeline.
         var primeFrames = PlayoutBufferMs / 20;
         var primeStart = DateTime.UtcNow;
         while (!ct.IsCancellationRequested)
@@ -726,7 +619,7 @@ public class VoiceSession
 
             await SendAudioFrameAsync(frame);
 
-            // Pace at 20ms per frame so Teams playback sounds natural.
+            // 20ms pacing so Teams playback sounds natural.
             next = next.AddMilliseconds(20);
             var delay = next - DateTime.UtcNow;
             if (delay > TimeSpan.Zero) await Task.Delay(delay, ct);
@@ -736,7 +629,7 @@ public class VoiceSession
 
     private async Task SendAudioFrameAsync(byte[] pcm)
     {
-        if (AcsWs.State != WebSocketState.Open) return;
+        if (MediaWs.State != WebSocketState.Open) return;
         var payload = new
         {
             kind = "AudioData",
@@ -745,12 +638,12 @@ public class VoiceSession
         };
         var json = JsonSerializer.Serialize(payload);
         var bytes = Encoding.UTF8.GetBytes(json);
-        await AcsWs.SendAsync(bytes, WebSocketMessageType.Text, true, CancellationToken.None);
+        await MediaWs.SendAsync(bytes, WebSocketMessageType.Text, true, CancellationToken.None);
     }
 
     private async Task SendStopAudioAsync()
     {
-        if (AcsWs.State != WebSocketState.Open) return;
+        if (MediaWs.State != WebSocketState.Open) return;
         var payload = new
         {
             kind = "StopAudio",
@@ -759,7 +652,7 @@ public class VoiceSession
         };
         var json = JsonSerializer.Serialize(payload);
         var bytes = Encoding.UTF8.GetBytes(json);
-        await AcsWs.SendAsync(bytes, WebSocketMessageType.Text, true, CancellationToken.None);
+        await MediaWs.SendAsync(bytes, WebSocketMessageType.Text, true, CancellationToken.None);
     }
 
     private async Task FlushPlayoutAsync()

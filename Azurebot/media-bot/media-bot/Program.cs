@@ -3,8 +3,7 @@
 //   POST /api/messages                       Bot Framework messaging
 //   POST /api/calling                        Incoming call webhook (bearer token)
 //   POST /api/calls/{callbackToken}/callback Per-call Graph notifications
-//   POST /api/acs-events                     ACS CloudEvents callback
-//   WS   /ws                                 ACS bidirectional media streaming
+//   WS   /ws                                 Bidirectional PCM media streaming
 //   POST /api/join                           Python → bot: join a meeting
 //   POST /api/leave                          Python → bot: leave a meeting
 //   GET  /api/status, /health                diagnostics
@@ -60,7 +59,7 @@ app.MapPost("/api/calls/{callbackToken}/callback", async (
 {
     using var ms = new MemoryStream();
     await request.Body.CopyToAsync(ms);
-    await handler.HandleCallEventAsync(BinaryData.FromBytes(ms.ToArray()), callbackToken);
+    await handler.HandleCallEventAsync(ms.ToArray(), callbackToken);
     return Results.Ok();
 });
 
@@ -69,23 +68,13 @@ app.MapPost("/api/calls", async (HttpRequest request, CallHandler handler) =>
 {
     using var ms = new MemoryStream();
     await request.Body.CopyToAsync(ms);
-    await handler.HandleCallEventAsync(BinaryData.FromBytes(ms.ToArray()));
+    await handler.HandleCallEventAsync(ms.ToArray());
     return Results.Ok();
 });
 
-// ─── ACS CloudEvents ────────────────────────────────────────
-
-app.MapPost("/api/acs-events", async (HttpRequest request, CallHandler handler) =>
-{
-    using var ms = new MemoryStream();
-    await request.Body.CopyToAsync(ms);
-    await handler.HandleAcsEventAsync(BinaryData.FromBytes(ms.ToArray()));
-    return Results.Ok();
-});
-
-// ─── ACS media streaming WebSocket ──────────────────────────
-// ACS connects here. Duplex: we receive inbound frames, we write TTS
-// OutStreamingData back to the same socket.
+// ─── Media streaming WebSocket ──────────────────────────────
+// The Teams media transport connects here. Duplex: we receive inbound PCM
+// frames and write TTS PCM chunks back on the same socket.
 
 app.Map("/ws", async (HttpContext context, CallHandler handler) =>
 {
